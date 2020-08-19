@@ -4,98 +4,264 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/plugin"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/plugin"
+	"github.com/nicksnyder/go-i18n/v2/i18n"
+
 	"github.com/matterpoll/matterpoll/server/poll"
 	"github.com/matterpoll/matterpoll/server/utils"
 )
 
 const (
-	// Parameter: SiteURL, PluginId
-	responseIconURL  = "%s/plugins/%s/logo_dark.png"
-	responseUsername = "Matterpoll"
+	// Parameter: SiteURL, manifest.ID
+	responseIconURL = "%s/plugins/%s/logo_dark.png"
+)
 
-	// Parameter: Trigger
-	commandHelpTextFormat = "To create a poll with the answer options \"Yes\" and \"No\" type `/%[1]s \"Question\"`.\n" +
-		"You can customise the options by typing `/%[1]s \"Question\" \"Answer 1\" \"Answer 2\" \"Answer 3\"`\n" +
-		"Poll Settings provider further customisation, e.g. `/%[1]s \"Question\" \"Answer 1\" \"Answer 2\" \"Answer 3\" --progress --anonymous`. The available Poll Settings are:\n" +
-		"- `--anonymous`: Don't show who voted for what at the end\n" +
-		"- `--progress`: During the poll, show how many votes each answer option got\n"
+var (
+	commandAutoCompleteDesc = &i18n.Message{
+		ID:    "command.autoComplete.desc",
+		Other: "Create a poll",
+	}
+	commandAutoCompleteHint = &i18n.Message{
+		ID:    "command.autoComplete.hint",
+		Other: `"[Question]" "[Answer 1]" "[Answer 2]"...`,
+	}
 
-	// Parameter: Trigger
-	commandInputErrorFormat = "Invalid input. Try /%[1]s \"Question\" or /%[1]s \"Question\" \"Answer 1\" \"Answer 2\" \"Answer 3\""
-	commandGenericError     = "Something went bad. Please try again later."
+	commandDefaultYes = &i18n.Message{
+		ID:    "command.default.yes",
+		Other: "Yes",
+	}
+	commandDefaultNo = &i18n.Message{
+		ID:    "command.default.no",
+		Other: "No",
+	}
+
+	commandHelpTextSimple = &i18n.Message{
+		ID:    "command.help.text.simple",
+		Other: "To create a poll with the answer options \"{{.Yes}}\" and \"{{.No}}\" type `/{{.Trigger}} \"Question\"`",
+	}
+	commandHelpTextOptions = &i18n.Message{
+		ID:    "command.help.text.options",
+		Other: "You can customize the options by typing `/{{.Trigger}} \"Question\" \"Answer 1\" \"Answer 2\" \"Answer 3\"`",
+	}
+	commandHelpTextPollSettingIntroduction = &i18n.Message{
+		ID:    "command.help.text.pollSetting.introduction",
+		Other: "Poll Settings provider further customization, e.g. `/{{.Trigger}} \"Question\" \"Answer 1\" \"Answer 2\" \"Answer 3\" --progress --anonymous`. The available Poll Settings are:",
+	}
+	commandHelpTextPollSettingAnonymous = &i18n.Message{
+		ID:    "command.help.text.pollSetting.anonymous",
+		Other: "Don't show who voted for what when the poll ends",
+	}
+	commandHelpTextPollSettingProgress = &i18n.Message{
+		ID:    "command.help.text.pollSetting.progress",
+		Other: "During the poll, show how many votes each answer option got",
+	}
+	commandHelpTextPollSettingPublicAddOption = &i18n.Message{
+		ID:    "command.help.text.pollSetting.public-add-option",
+		Other: "Allow all users to add additional options",
+	}
+
+	commandErrorGeneric = &i18n.Message{
+		ID:    "command.error.generic",
+		Other: "Something went wrong. Please try again later.",
+	}
+	commandErrorinvalidNumberOfOptions = &i18n.Message{
+		ID:    "command.error.invalidNumberOfOptions",
+		Other: "You must provide either no answer or at least two answers.",
+	}
+	commandErrorInvalidInput = &i18n.Message{
+		ID:    "command.error.invalidInput",
+		Other: "Invalid input: {{.Error}}",
+	}
 )
 
 // ExecuteCommand parses a given input and creates a poll if the input is correct
 func (p *MatterpollPlugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
+	msg, appErr := p.executeCommand(args)
+	if msg != "" {
+		p.SendEphemeralPost(args.ChannelId, args.UserId, msg)
+	}
+	return &model.CommandResponse{}, appErr
+}
+
+func (p *MatterpollPlugin) executeCommand(args *model.CommandArgs) (string, *model.AppError) {
 	creatorID := args.UserId
-	siteURL := *p.ServerConfig.ServiceSettings.SiteURL
 	configuration := p.getConfiguration()
 
+	userLocalizer := p.getUserLocalizer(creatorID)
+	publicLocalizer := p.getServerLocalizer()
+
+	defaultYes := p.LocalizeDefaultMessage(publicLocalizer, commandDefaultYes)
+	defaultNo := p.LocalizeDefaultMessage(publicLocalizer, commandDefaultNo)
+
 	q, o, s := utils.ParseInput(args.Command, configuration.Trigger)
-	if q == "" || q == "help" {
-		msg := fmt.Sprintf(commandHelpTextFormat, configuration.Trigger)
-		return getCommandResponse(model.COMMAND_RESPONSE_TYPE_EPHEMERAL, msg, siteURL, nil), nil
+	if q == "" {
+		siteURL := *p.ServerConfig.ServiceSettings.SiteURL
+		dialog := model.OpenDialogRequest{
+			TriggerId: args.TriggerId,
+			URL:       fmt.Sprintf("/plugins/%s/api/v1/polls/create", manifest.ID),
+			Dialog:    p.getCreatePollDialog(siteURL, args.RootId, userLocalizer),
+		}
+
+		if appErr := p.API.OpenInteractiveDialog(dialog); appErr != nil {
+			p.API.LogWarn("failed to open create poll dialog", "err", appErr.Error())
+			return p.LocalizeDefaultMessage(userLocalizer, commandErrorGeneric), nil
+		}
+		return "", nil
 	}
+
+	if q == "help" {
+		msg := p.LocalizeWithConfig(userLocalizer, &i18n.LocalizeConfig{
+			DefaultMessage: commandHelpTextSimple,
+			TemplateData:   map[string]interface{}{"Trigger": configuration.Trigger, "Yes": defaultYes, "No": defaultNo},
+		}) + "\n"
+		msg += p.LocalizeWithConfig(userLocalizer, &i18n.LocalizeConfig{
+			DefaultMessage: commandHelpTextOptions,
+			TemplateData:   map[string]interface{}{"Trigger": configuration.Trigger},
+		}) + "\n"
+		msg += p.LocalizeWithConfig(userLocalizer, &i18n.LocalizeConfig{
+			DefaultMessage: commandHelpTextPollSettingIntroduction,
+			TemplateData:   map[string]interface{}{"Trigger": configuration.Trigger},
+		}) + "\n"
+		msg += "- `--anonymous`: " + p.LocalizeDefaultMessage(userLocalizer, commandHelpTextPollSettingAnonymous) + "\n"
+		msg += "- `--progress`: " + p.LocalizeDefaultMessage(userLocalizer, commandHelpTextPollSettingProgress) + "\n"
+		msg += "- `--public-add-option`: " + p.LocalizeDefaultMessage(userLocalizer, commandHelpTextPollSettingPublicAddOption)
+
+		return msg, nil
+	}
+
 	if len(o) == 1 {
-		return nil, &model.AppError{
-			Id:         fmt.Sprintf(commandInputErrorFormat, configuration.Trigger),
+		return "", &model.AppError{
+			Id:         p.LocalizeDefaultMessage(userLocalizer, commandErrorinvalidNumberOfOptions),
 			StatusCode: http.StatusBadRequest,
 			Where:      "ExecuteCommand",
 		}
 	}
 
 	var newPoll *poll.Poll
-	var err error
+	var errMsg *poll.ErrorMessage
 	if len(o) == 0 {
-		newPoll, err = poll.NewPoll(creatorID, q, []string{"Yes", "No"}, s)
+		newPoll, errMsg = poll.NewPoll(creatorID, q, []string{defaultYes, defaultNo}, s)
 	} else {
-		newPoll, err = poll.NewPoll(creatorID, q, o, s)
+		newPoll, errMsg = poll.NewPoll(creatorID, q, o, s)
 	}
-	if err != nil {
-		return nil, &model.AppError{
-			Id:         "Invalid input: " + err.Error(),
+	if errMsg != nil {
+		appErr := &model.AppError{
+			Id: p.LocalizeWithConfig(userLocalizer, &i18n.LocalizeConfig{
+				DefaultMessage: commandErrorInvalidInput,
+				TemplateData: map[string]interface{}{
+					"Error": p.LocalizeErrorMessage(userLocalizer, errMsg),
+				}}),
 			StatusCode: http.StatusBadRequest,
 			Where:      "ExecuteCommand",
 		}
+		return "", appErr
 	}
 
-	if err := p.Store.Poll().Save(newPoll); err != nil {
-		p.API.LogError("failed to save poll", "err", err.Error())
-		return getCommandResponse(model.COMMAND_RESPONSE_TYPE_EPHEMERAL, commandGenericError, siteURL, nil), nil
+	if err := p.Store.Poll().Insert(newPoll); err != nil {
+		p.API.LogWarn("failed to save poll", "error", err.Error())
+		return p.LocalizeDefaultMessage(userLocalizer, commandErrorGeneric), nil
 	}
 
 	displayName, appErr := p.ConvertCreatorIDToDisplayName(creatorID)
 	if appErr != nil {
-		p.API.LogError("failed to ConvertCreatorIDToDisplayName", "err", appErr)
-		return getCommandResponse(model.COMMAND_RESPONSE_TYPE_EPHEMERAL, commandGenericError, siteURL, nil), nil
+		p.API.LogWarn("failed to ConvertCreatorIDToDisplayName", "error", appErr.Error())
+		return p.LocalizeDefaultMessage(userLocalizer, commandErrorGeneric), nil
 	}
 
-	actions := newPoll.ToPostActions(*p.ServerConfig.ServiceSettings.SiteURL, PluginId, displayName)
-	response := getCommandResponse(model.COMMAND_RESPONSE_TYPE_IN_CHANNEL, "", *p.ServerConfig.ServiceSettings.SiteURL, actions)
-	p.API.LogDebug("Created a new poll", "response", response.ToJson())
-	return response, nil
-}
-
-func getCommandResponse(responseType, text, siteURL string, attachments []*model.SlackAttachment) *model.CommandResponse {
-	return &model.CommandResponse{
-		ResponseType: responseType,
-		Text:         text,
-		Username:     responseUsername,
-		IconURL:      fmt.Sprintf(responseIconURL, siteURL, PluginId),
-		Type:         model.POST_DEFAULT,
-		Attachments:  attachments,
+	actions := newPoll.ToPostActions(publicLocalizer, manifest.ID, displayName)
+	post := &model.Post{
+		UserId:    p.botUserID,
+		ChannelId: args.ChannelId,
+		RootId:    args.RootId,
+		Type:      MatterpollPostType,
+		Props: map[string]interface{}{
+			"poll_id": newPoll.ID,
+		},
 	}
+	model.ParseSlackAttachment(post, actions)
+
+	if _, appErr = p.API.CreatePost(post); appErr != nil {
+		p.API.LogWarn("failed to post poll post", "error", appErr.Error())
+		return p.LocalizeDefaultMessage(userLocalizer, commandErrorGeneric), nil
+	}
+
+	p.API.LogDebug("Created a new poll", "post", post.ToJson())
+	return "", nil
 }
 
-func getCommand(trigger string) *model.Command {
+func (p *MatterpollPlugin) getCommand(trigger string) *model.Command {
+	localizer := p.getServerLocalizer()
+
 	return &model.Command{
 		Trigger:          trigger,
-		DisplayName:      "Matterpoll",
-		Description:      "Polling feature by https://github.com/matterpoll/matterpoll",
 		AutoComplete:     true,
-		AutoCompleteDesc: "Create a poll",
-		AutoCompleteHint: "[Question] [Answer 1] [Answer 2]...",
+		AutoCompleteDesc: p.LocalizeDefaultMessage(localizer, commandAutoCompleteDesc),
+		AutoCompleteHint: p.LocalizeDefaultMessage(localizer, commandAutoCompleteHint),
 	}
+}
+
+func (p *MatterpollPlugin) getCreatePollDialog(siteURL, rootID string, l *i18n.Localizer) model.Dialog {
+	elements := []model.DialogElement{{
+		DisplayName: p.LocalizeDefaultMessage(l, &i18n.Message{
+			ID:    "dialog.createPoll.question",
+			Other: "Question",
+		}),
+		Name:    questionKey,
+		Type:    "text",
+		SubType: "text",
+	}}
+	for i := 1; i < 4; i++ {
+		elements = append(elements, model.DialogElement{
+			DisplayName: p.LocalizeWithConfig(l, &i18n.LocalizeConfig{
+				DefaultMessage: &i18n.Message{
+					ID:    "dialog.createPoll.option",
+					Other: "Option {{ .Number }}",
+				},
+				TemplateData: map[string]interface{}{
+					"Number": i,
+				}}),
+			Name:     fmt.Sprintf("option%v", i),
+			Type:     "text",
+			SubType:  "text",
+			Optional: i > 2,
+		})
+	}
+	elements = append(elements, model.DialogElement{
+		DisplayName: "Anonymous",
+		Name:        "setting-anonymous",
+		Type:        "bool",
+		Placeholder: p.LocalizeDefaultMessage(l, commandHelpTextPollSettingAnonymous),
+		Optional:    true,
+	})
+	elements = append(elements, model.DialogElement{
+		DisplayName: "Progress",
+		Name:        "setting-progress",
+		Type:        "bool",
+		Placeholder: p.LocalizeDefaultMessage(l, commandHelpTextPollSettingProgress),
+		Optional:    true,
+	})
+	elements = append(elements, model.DialogElement{
+		DisplayName: "Public Add Option",
+		Name:        "setting-public-add-option",
+		Type:        "bool",
+		Placeholder: p.LocalizeDefaultMessage(l, commandHelpTextPollSettingPublicAddOption),
+		Optional:    true,
+	})
+
+	dialog := model.Dialog{
+		CallbackId: rootID,
+		Title: p.LocalizeDefaultMessage(l, &i18n.Message{
+			ID:    "dialog.create.title",
+			Other: "Create Poll",
+		}),
+		IconURL: fmt.Sprintf(responseIconURL, siteURL, manifest.ID),
+		SubmitLabel: p.LocalizeDefaultMessage(l, &i18n.Message{
+			ID:    "dialog.create.submitLabel",
+			Other: "Create",
+		}),
+		Elements: elements,
+	}
+
+	return dialog
 }

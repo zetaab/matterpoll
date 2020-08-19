@@ -3,8 +3,9 @@ package utils_test
 import (
 	"testing"
 
-	"github.com/matterpoll/matterpoll/server/utils"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/matterpoll/matterpoll/server/utils"
 )
 
 func TestParseInput(t *testing.T) {
@@ -41,6 +42,13 @@ func TestParseInput(t *testing.T) {
 			Trigger:          "poll",
 			ExpectedQuestion: "A",
 			ExpectedOptions:  []string{"B", "C"},
+			ExpectedSettings: []string{},
+		},
+		"Replace curlyquotes": {
+			Input:            `/poll “A“ ”BBB” “CCC”`,
+			Trigger:          "poll",
+			ExpectedQuestion: `A`,
+			ExpectedOptions:  []string{"BBB", "CCC"},
 			ExpectedSettings: []string{},
 		},
 		"No options": {

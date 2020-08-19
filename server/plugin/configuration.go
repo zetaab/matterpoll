@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/pkg/errors"
 )
 
@@ -8,33 +9,50 @@ import (
 // configuration, as well as values computed from the configuration. Any public fields will be
 // deserialized from the Mattermost server configuration in OnConfigurationChange.
 type configuration struct {
-	Trigger string
+	Trigger        string `json:"trigger"`
+	ExperimentalUI bool   `json:"experimentalui"`
 }
 
 // OnConfigurationChange loads the plugin configuration, validates it and saves it.
 func (p *MatterpollPlugin) OnConfigurationChange() error {
 	configuration := new(configuration)
 	oldConfiguration := p.getConfiguration()
+	p.ServerConfig = p.API.GetConfig()
 
 	if err := p.API.LoadPluginConfiguration(configuration); err != nil {
 		return errors.Wrap(err, "failed to load plugin configuration")
 	}
 
 	if configuration.Trigger == "" {
-		return errors.New("Empty trigger not allowed")
+		return errors.New("empty trigger not allowed")
 	}
 
-	if oldConfiguration.Trigger != "" {
-		if err := p.API.UnregisterCommand("", oldConfiguration.Trigger); err != nil {
-			return errors.Wrap(err, "failed to unregister old command")
+	// This require a loaded i18n bundle
+	if p.isActivated() {
+		// Update slash command help text
+		if oldConfiguration.Trigger != "" {
+			if err := p.API.UnregisterCommand("", oldConfiguration.Trigger); err != nil {
+				return errors.Wrap(err, "failed to unregister old command")
+			}
+		}
+		if err := p.API.RegisterCommand(p.getCommand(configuration.Trigger)); err != nil {
+			return errors.Wrap(err, "failed to register new command")
+		}
+		// Update bot description
+		if err := p.patchBotDescription(); err != nil {
+			return errors.Wrap(err, "failed to patch bot description")
 		}
 	}
-	if err := p.API.RegisterCommand(getCommand(configuration.Trigger)); err != nil {
-		return errors.Wrap(err, "failed to register new command")
+
+	p.setConfiguration(configuration)
+
+	// Emit experimental settings to client if changed
+	if oldConfiguration.ExperimentalUI != configuration.ExperimentalUI {
+		p.API.PublishWebSocketEvent("configuration_change", map[string]interface{}{
+			"experimentalui": configuration.ExperimentalUI,
+		}, &model.WebsocketBroadcast{})
 	}
 
-	p.ServerConfig = p.API.GetConfig()
-	p.setConfiguration(configuration)
 	return nil
 }
 
